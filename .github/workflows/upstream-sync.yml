@@ -1,0 +1,89 @@
+name: Upstream Sync
+
+# Nightly: fast-forward t3code-upstream to pingdotgg/t3code main, keep one open pull request
+# from it into main, and disable the workflows inherited from T3 Code (they need T3's runners
+# and secrets). Moving the branch is a ref update through the API: forks share objects with
+# their parent, so nothing is cloned.
+on:
+  schedule:
+    - cron: "41 2 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: upstream-sync
+
+env:
+  UPSTREAM: pingdotgg/t3code
+  MIRROR_BRANCH: t3code-upstream
+  # Every other workflow in this repo is disabled on each run, so new upstream ones stay off.
+  ALLOWED_WORKFLOWS: .github/workflows/upstream-sync.yml
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      # A fine-grained token for this repo with read/write on Contents, Workflows, Pull requests
+      # and Actions. GITHUB_TOKEN cannot move a branch onto commits that change workflow files.
+      GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Check token
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::Add the UPSTREAM_SYNC_TOKEN repository secret first."
+            exit 1
+          fi
+
+      - name: Disable inherited workflows
+        run: |
+          gh api --paginate "repos/$GH_REPO/actions/workflows" \
+            --jq '.workflows[] | select(.state == "active") | "\(.id) \(.path)"' |
+          while read -r id path; do
+            case " $ALLOWED_WORKFLOWS " in *" $path "*) continue ;; esac
+            echo "Disabling $path"
+            gh api -X PUT "repos/$GH_REPO/actions/workflows/$id/disable"
+          done
+
+      - name: Fast-forward the mirror branch
+        run: |
+          sha=$(gh api "repos/$UPSTREAM/commits/main" --jq .sha)
+          current=$(gh api "repos/$GH_REPO/git/ref/heads/$MIRROR_BRANCH" --jq .object.sha 2>/dev/null || true)
+          if [ "$current" = "$sha" ]; then
+            echo "$MIRROR_BRANCH is already at $sha"
+          elif [ -z "$current" ]; then
+            gh api -X POST "repos/$GH_REPO/git/refs" -f ref="refs/heads/$MIRROR_BRANCH" -f sha="$sha" > /dev/null
+            echo "Created $MIRROR_BRANCH at $sha"
+          else
+            # force=false: if upstream ever rewrites main, fail loudly instead of moving the merge base.
+            gh api -X PATCH "repos/$GH_REPO/git/refs/heads/$MIRROR_BRANCH" -f sha="$sha" -F force=false > /dev/null
+            echo "$MIRROR_BRANCH: $current -> $sha"
+          fi
+
+      - name: Open the sync pull request
+        run: |
+          ahead=$(gh api "repos/$GH_REPO/compare/main...$MIRROR_BRANCH" --jq .ahead_by)
+          if [ "$ahead" = "0" ]; then
+            echo "main already has every upstream commit"
+            exit 0
+          fi
+          open=$(gh api "repos/$GH_REPO/pulls?state=open&base=main&head=$GITHUB_REPOSITORY_OWNER:$MIRROR_BRANCH" --jq length)
+          if [ "$open" != "0" ]; then
+            echo "Sync pull request is already open; it follows $MIRROR_BRANCH ($ahead commits)"
+            exit 0
+          fi
+          cat > "$RUNNER_TEMP/body.md" <<'EOF'
+          Brings main up to date with pingdotgg/t3code. This pull request follows `t3code-upstream`, which the nightly Upstream Sync moves forward, so it stays current until merged.
+
+          - Merge with a **merge commit**. Never squash or rebase: main must keep upstream's history so the next sync brings only new commits.
+          - If it conflicts, merge `t3code-upstream` into a branch off main, resolve there, and open that branch instead. Never commit to `t3code-upstream`.
+          - To take only some changes, cherry-pick them from `t3code-upstream` onto a branch off main.
+          EOF
+          gh api -X POST "repos/$GH_REPO/pulls" \
+            -f title="chore: sync T3 Code upstream" \
+            -f head="$MIRROR_BRANCH" \
+            -f base=main \
+            -F body=@"$RUNNER_TEMP/body.md" \
+            --jq .html_url
